@@ -1,0 +1,147 @@
+
+import socket
+import threading
+import struct
+import os
+import logging
+from typing import Dict, Tuple
+from cryptography.hazmat.primitives.asymmetric import x25519
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+# CONFIG
+HOST = "0.0.0.0"
+PORT = 5000
+LOG_PLAINTEXT = True   # WARNING: set False to log encrypted blobs instead
+LOG_PATH = "chat_plaintext.log"
+NONCE_SIZE = 12  # recommended for AES-GCM
+
+# Basic logging config
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+# Global state
+clients_lock = threading.Lock()
+clients: Dict[socket.socket, Tuple[AESGCM, bytes]] = {}
+# mapping: socket -> (aesgcm_object, client_name_bytes)
+
+def derive_key(shared_secret: bytes) -> bytes:
+    # Derive 32 bytes key using HKDF-SHA256
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=None,
+        info=b"chat app v1",
+    )
+    return hkdf.derive(shared_secret)
+
+def send_frame(sock: socket.socket, data: bytes):
+    sock.sendall(struct.pack("!I", len(data)) + data)
+
+def recv_frame(sock: socket.socket) -> bytes:
+    header = sock.recv(4)
+    if not header:
+        raise ConnectionError("Disconnected")
+    length = struct.unpack("!I", header)[0]
+    payload = b""
+    while len(payload) < length:
+        chunk = sock.recv(length - len(payload))
+        if not chunk:
+            raise ConnectionError("Disconnected while reading payload")
+        payload += chunk
+    return payload
+
+def handle_client(conn: socket.socket, addr):
+    logging.info(f"Client connected: {addr}")
+    try:
+        # 1) Server generates ephemeral X25519 and sends its public key
+        server_priv = x25519.X25519PrivateKey.generate()
+        server_pub = server_priv.public_key().public_bytes()
+        # send server public key (framed)
+        send_frame(conn, server_pub)
+
+        # 2) receive client's public key
+        client_pub = recv_frame(conn)
+        client_pub_key = x25519.X25519PublicKey.from_public_bytes(client_pub)
+
+        # 3) compute shared secret and derive AES key
+        shared = server_priv.exchange(client_pub_key)
+        aes_key = derive_key(shared)
+        aesgcm = AESGCM(aes_key)
+
+        # 4) receive client name (framed, encrypted)
+        enc_name_blob = recv_frame(conn)
+        # enc_name_blob = nonce(12) + ciphertext (which includes tag)
+        nonce = enc_name_blob[:NONCE_SIZE]
+        ciphertext = enc_name_blob[NONCE_SIZE:]
+        client_name = aesgcm.decrypt(nonce, ciphertext, None).decode()
+
+        # store client
+        with clients_lock:
+            clients[conn] = (aesgcm, client_name.encode())
+
+        logging.info(f"Registered client name: {client_name} from {addr}")
+
+        # main loop: receive encrypted messages and broadcast
+        while True:
+            blob = recv_frame(conn)
+            nonce = blob[:NONCE_SIZE]
+            ciphertext = blob[NONCE_SIZE:]
+            plaintext = aesgcm.decrypt(nonce, ciphertext, None)  # bytes
+            # plaintext format: b"MSG:<message text>"
+            text = plaintext.decode(errors="ignore")
+            logging.info(f"[{client_name}] {text}")
+
+            # Logging to file (if enabled) - WARNING about storing plaintext
+            if LOG_PLAINTEXT:
+                with open(LOG_PATH, "a", encoding="utf-8") as f:
+                    f.write(f"{client_name}: {text}\n")
+
+            # Broadcast to other clients (re-encrypt with each client's key)
+            with clients_lock:
+                for other_sock, (other_aesgcm, other_name_bytes) in list(clients.items()):
+                    if other_sock is conn:
+                        continue
+                    # Build message: prefix sender name so clients can display
+                    send_plain = f"{client_name}: {text}".encode()
+                    out_nonce = os.urandom(NONCE_SIZE)
+                    out_ct = other_aesgcm.encrypt(out_nonce, send_plain, None)
+                    out_blob = out_nonce + out_ct
+                    try:
+                        send_frame(other_sock, out_blob)
+                    except Exception:
+                        logging.exception("Failed to send to a client; removing")
+                        # remove client
+                        del clients[other_sock]
+                        other_sock.close()
+
+    except ConnectionError:
+        logging.info(f"Client {addr} disconnected")
+    except Exception:
+        logging.exception("Error handling client")
+    finally:
+        with clients_lock:
+            if conn in clients:
+                del clients[conn]
+        conn.close()
+
+def main():
+    # Optionally clear log on start
+    if LOG_PLAINTEXT and os.path.exists(LOG_PATH):
+        os.remove(LOG_PATH)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind((HOST, PORT))
+    sock.listen(8)
+    logging.info(f"Server listening on {HOST}:{PORT}")
+    try:
+        while True:
+            conn, addr = sock.accept()
+            t = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
+            t.start()
+    except KeyboardInterrupt:
+        logging.info("Shutting down server")
+    finally:
+        sock.close()
+
+if __name__ == "__main__":
+    main()
