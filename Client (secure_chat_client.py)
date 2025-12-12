@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""
+Secure Encrypted Chat Client
+- Performs X25519 key exchange with server
+- Derives AES-256-GCM key and sends/receives encrypted messages
+- Simple input loop and background receiver thread
+"""
+
+import socket
+import struct
+import threading
+import os
+import sys
+from cryptography.hazmat.primitives.asymmetric import x25519
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+SERVER_HOST = "127.0.0.1"
+SERVER_PORT = 5000
+NONCE_SIZE = 12
+
+def derive_key(shared_secret: bytes) -> bytes:
+    hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=b"chat app v1")
+    return hkdf.derive(shared_secret)
+
+def send_frame(sock: socket.socket, data: bytes):
+    sock.sendall(struct.pack("!I", len(data)) + data)
+
+def recv_frame(sock: socket.socket) -> bytes:
+    header = sock.recv(4)
+    if not header:
+        raise ConnectionError("Disconnected")
+    length = struct.unpack("!I", header)[0]
+    payload = b""
+    while len(payload) < length:
+        chunk = sock.recv(length - len(payload))
+        if not chunk:
+            raise ConnectionError("Disconnected while reading payload")
+        payload += chunk
+    return payload
+
+def receiver_loop(sock: socket.socket, aesgcm: AESGCM):
+    try:
+        while True:
+            blob = recv_frame(sock)
+            nonce = blob[:NONCE_SIZE]
+            ciphertext = blob[NONCE_SIZE:]
+            plaintext = aesgcm.decrypt(nonce, ciphertext, None)
+            print(plaintext.decode(errors="ignore"))
+    except ConnectionError:
+        print("Server closed connection.")
+    except Exception:
+        print("Receiver error.")
+    finally:
+        sock.close()
+        os._exit(0)
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python secure_chat_client.py <your_name> [server_host] [server_port]")
+        return
+    name = sys.argv[1]
+    host = sys.argv[2] if len(sys.argv) >= 3 else SERVER_HOST
+    port = int(sys.argv[3]) if len(sys.argv) >= 4 else SERVER_PORT
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.connect((host, port))
+
+    # 1) Receive server public key
+    server_pub = recv_frame(sock)
+    server_pub_key = x25519.X25519PublicKey.from_public_bytes(server_pub)
+
+    # 2) Generate client private/public and send public
+    client_priv = x25519.X25519PrivateKey.generate()
+    client_pub = client_priv.public_key().public_bytes()
+    send_frame(sock, client_pub)
+
+    # 3) derive shared key
+    shared = client_priv.exchange(server_pub_key)
+    aes_key = derive_key(shared)
+    aesgcm = AESGCM(aes_key)
+
+    # 4) send client name encrypted
+    nonce = os.urandom(NONCE_SIZE)
+    ct = aesgcm.encrypt(nonce, name.encode(), None)
+    send_frame(sock, nonce + ct)
+
+    # start receiver thread
+    t = threading.Thread(target=receiver_loop, args=(sock, aesgcm), daemon=True)
+    t.start()
+
+    try:
+        while True:
+            line = input()
+            if not line:
+                continue
+            # optionally prefix with MSG:, or send as is
+            plaintext = line.encode()
+            out_nonce = os.urandom(NONCE_SIZE)
+            out_ct = aesgcm.encrypt(out_nonce, plaintext, None)
+            send_frame(sock, out_nonce + out_ct)
+    except KeyboardInterrupt:
+        print("Exiting")
+    finally:
+        sock.close()
+
+if __name__ == "__main__":
+    main()
